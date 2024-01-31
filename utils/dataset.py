@@ -77,7 +77,6 @@ def unnormalize_data(ndata, stats):
     return data
 
 
-# dataset
 class PushTStateDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_path,
                  pred_horizon, obs_horizon, action_horizon):
@@ -137,4 +136,138 @@ class PushTStateDataset(torch.utils.data.Dataset):
 
         # discard unused observations
         nsample['obs'] = nsample['obs'][:self.obs_horizon, :]
+        return nsample
+
+
+class PushTImageEnv(PushTEnv):
+    metadata = {"render.modes": ["rgb_array"], "video.frames_per_second": 10}
+
+    def __init__(self,
+            legacy=False,
+            block_cog=None,
+            damping=None,
+            render_size=96):
+        super().__init__(
+            legacy=legacy,
+            block_cog=block_cog,
+            damping=damping,
+            render_size=render_size,
+            render_action=False)
+        ws = self.window_size
+        self.observation_space = spaces.Dict({
+            'image': spaces.Box(
+                low=0,
+                high=1,
+                shape=(3,render_size,render_size),
+                dtype=np.float32
+            ),
+            'agent_pos': spaces.Box(
+                low=0,
+                high=ws,
+                shape=(2,),
+                dtype=np.float32
+            )
+        })
+        self.render_cache = None
+
+    def _get_obs(self):
+        img = super()._render_frame(mode='rgb_array')
+
+        agent_pos = np.array(self.agent.position)
+        img_obs = np.moveaxis(img.astype(np.float32) / 255, -1, 0)
+        obs = {
+            'image': img_obs,
+            'agent_pos': agent_pos
+        }
+
+        # draw action
+        if self.latest_action is not None:
+            action = np.array(self.latest_action)
+            coord = (action / 512 * 96).astype(np.int32)
+            marker_size = int(8/96*self.render_size)
+            thickness = int(1/96*self.render_size)
+            cv2.drawMarker(img, coord,
+                color=(255,0,0), markerType=cv2.MARKER_CROSS,
+                markerSize=marker_size, thickness=thickness)
+        self.render_cache = img
+
+        return obs
+
+    def render(self, mode):
+        assert mode == 'rgb_array'
+
+        if self.render_cache is None:
+            self._get_obs()
+
+        return self.render_cache
+
+
+class PushTImageDataset(torch.utils.data.Dataset):
+    def __init__(self,
+                 dataset_path: str,
+                 pred_horizon: int,
+                 obs_horizon: int,
+                 action_horizon: int):
+
+        # read from zarr dataset
+        dataset_root = zarr.open(dataset_path, 'r')
+
+        # float32, [0,1], (N,96,96,3)
+        train_image_data = dataset_root['data']['img'][:]
+        train_image_data = np.moveaxis(train_image_data, -1,1)
+        # (N,3,96,96)
+
+        # (N, D)
+        train_data = {
+            # first two dims of state vector are agent (i.e. gripper) locations
+            'agent_pos': dataset_root['data']['state'][:,:2],
+            'action': dataset_root['data']['action'][:]
+        }
+        episode_ends = dataset_root['meta']['episode_ends'][:]
+
+        # compute start and end of each state-action sequence
+        # also handles padding
+        indices = create_sample_indices(
+            episode_ends=episode_ends,
+            sequence_length=pred_horizon,
+            pad_before=obs_horizon-1,
+            pad_after=action_horizon-1)
+
+        # compute statistics and normalized data to [-1,1]
+        stats = dict()
+        normalized_train_data = dict()
+        for key, data in train_data.items():
+            stats[key] = get_data_stats(data)
+            normalized_train_data[key] = normalize_data(data, stats[key])
+
+        # images are already normalized
+        normalized_train_data['image'] = train_image_data
+
+        self.indices = indices
+        self.stats = stats
+        self.normalized_train_data = normalized_train_data
+        self.pred_horizon = pred_horizon
+        self.action_horizon = action_horizon
+        self.obs_horizon = obs_horizon
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        # get the start/end indices for this datapoint
+        buffer_start_idx, buffer_end_idx, \
+            sample_start_idx, sample_end_idx = self.indices[idx]
+
+        # get nomralized data using these indices
+        nsample = sample_sequence(
+            train_data=self.normalized_train_data,
+            sequence_length=self.pred_horizon,
+            buffer_start_idx=buffer_start_idx,
+            buffer_end_idx=buffer_end_idx,
+            sample_start_idx=sample_start_idx,
+            sample_end_idx=sample_end_idx
+        )
+        # discard unused observations
+        nsample['image'] = nsample['image'][:self.obs_horizon,:]
+        nsample['agent_pos'] = nsample['agent_pos'][:self.obs_horizon,:]
         return nsample
